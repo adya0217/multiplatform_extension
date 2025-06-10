@@ -1,0 +1,66 @@
+{
+    "manifest_version": 3,
+    "name": "Multiplatform GIF Picker",
+    "version": "1.0",
+    "description": "A GIF picker extension that works across multiple platforms",
+    "permissions": [
+        "activeTab",
+        "storage",
+        "scripting"
+    ],
+    "host_permissions": [
+        "*://*.discord.com/*",
+        "*://*.twitter.com/*",
+        "*://*.x.com/*",
+        "*://*.reddit.com/*",
+        "*://*.instagram.com/*",
+        "*://*.facebook.com/*",
+        "*://*.whatsapp.com/*",
+        "*://*.telegram.org/*",
+        "*://*.slack.com/*",
+        "*://*.teams.microsoft.com/*",
+        "http://localhost:11434/*",
+        "http://127.0.0.1:11434/*"
+    ],
+    "background": {
+        "service_worker": "background.js",
+        "type": "module"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "*://*.discord.com/*",
+                "*://*.twitter.com/*",
+                "*://*.x.com/*",
+                "*://*.reddit.com/*",
+                "*://*.instagram.com/*",
+                "*://*.facebook.com/*",
+                "*://*.whatsapp.com/*",
+                "*://*.telegram.org/*",
+                "*://*.slack.com/*",
+                "*://*.teams.microsoft.com/*"
+            ],
+            "js": [
+                "content.js"
+            ],
+            "run_at": "document_idle",
+            "all_frames": false
+        }
+    ],
+    "content_security_policy": {
+        "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' http://localhost:11434/ http://127.0.0.1:11434/ ws://localhost:11434/ ws://127.0.0.1:11434/"
+    },
+    "web_accessible_resources": [
+        {
+            "resources": [
+                "content.js"
+            ],
+            "matches": [
+                "<all_urls>"
+            ]
+        }
+    ],
+    "action": {
+        "default_title": "Multiplatform GIF Picker"
+    }
+}
