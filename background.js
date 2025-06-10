@@ -41,7 +41,8 @@ async function analyzeTextWithOllama(text) {
             method: 'GET',
             headers: {
                 'Accept': 'application/json'
-            }
+            },
+            timeout: 5000 // 5 second timeout for initial check
         });
 
         if (!checkResponse.ok) {
@@ -61,77 +62,88 @@ async function analyzeTextWithOllama(text) {
         - "that's so funny" -> "laughing hard, rolling on floor, funny reaction"
         - "good morning" -> "sunrise greeting, morning coffee, waking up happy"
         - "congratulations" -> "celebration dance, happy jump, success party"
-        Dont focus on just these , analye it on your own.
-        Dont generate differnt responses for the same text stick to one type of response.
         
         Extract 2-3 specific words or short phrases that would be good for searching animated GIFs.
         Focus on actions and emotions that would make a good animated response.
         Just list the words/phrases separated by commas, nothing else.`;
 
-        const response = await fetch('http://127.0.0.1:11434/api/generate', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            },
-            body: JSON.stringify({
-                model: 'mistral:7b-instruct',
-                prompt: prompt,
-                stream: false,
-                options: {
-                    temperature: 0.3,
-                    top_p: 0.9,
-                    top_k: 40
-                }
-            })
-        });
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error('[SmartSticker] Ollama API error response:', errorText);
-            throw new Error(`Ollama API error: ${response.status} ${response.statusText}`);
-        }
+        try {
+            const response = await fetch('http://127.0.0.1:11434/api/generate', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                body: JSON.stringify({
+                    model: 'mistral:7b-instruct',
+                    prompt: prompt,
+                    stream: false,
+                    options: {
+                        temperature: 0.3,
+                        top_p: 0.9,
+                        top_k: 40
+                    }
+                }),
+                signal: controller.signal
+            });
 
-        const data = await response.json();
-        console.log('[SmartSticker] Received Ollama response:', data);
+            clearTimeout(timeoutId);
 
-        if (!data.response) {
-            throw new Error('Invalid response from Ollama API');
-        }
+            if (!response.ok) {
+                const errorText = await response.text();
+                console.error('[SmartSticker] Ollama API error response:', errorText);
+                throw new Error(`Ollama API error: ${response.status} ${response.statusText}`);
+            }
 
-        // Parse the keywords from the response
-        const keywords = data.response
-            .split(',')
-            .map(k => k.trim())
-            .filter(k => k.length > 0);
+            const data = await response.json();
+            console.log('[SmartSticker] Received Ollama response:', data);
 
-        // If no good keywords were found, use a fallback based on the input text
-        if (keywords.length === 0) {
-            const fallbackKeywords = text
-                .toLowerCase()
-                .split(/\s+/)
-                .filter(word => word.length > 3 && !['what', 'when', 'where', 'which', 'whose', 'whom', 'this', 'that', 'these', 'those'].includes(word));
+            if (!data.response) {
+                throw new Error('Invalid response from Ollama API');
+            }
+
+            // Parse the keywords from the response
+            const keywords = data.response
+                .split(',')
+                .map(k => k.trim())
+                .filter(k => k.length > 0);
+
+            // If no good keywords were found, use a fallback based on the input text
+            if (keywords.length === 0) {
+                const fallbackKeywords = text
+                    .toLowerCase()
+                    .split(/\s+/)
+                    .filter(word => word.length > 3 && !['what', 'when', 'where', 'which', 'whose', 'whom', 'this', 'that', 'these', 'those'].includes(word));
+
+                return {
+                    success: true,
+                    data: {
+                        sentiment: 'neutral',
+                        emotions: fallbackKeywords,
+                        intensity: 'medium',
+                        gif_query: fallbackKeywords.join(' ')
+                    }
+                };
+            }
 
             return {
                 success: true,
                 data: {
                     sentiment: 'neutral',
-                    emotions: fallbackKeywords,
+                    emotions: keywords,
                     intensity: 'medium',
-                    gif_query: fallbackKeywords.join(' ')
+                    gif_query: keywords.join(' ')
                 }
             };
-        }
-
-        return {
-            success: true,
-            data: {
-                sentiment: 'neutral',
-                emotions: keywords,
-                intensity: 'medium',
-                gif_query: keywords.join(' ')
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                throw new Error('Analysis timed out after 30 seconds');
             }
-        };
+            throw error;
+        }
     } catch (error) {
         console.error('[SmartSticker] Error analyzing text with Ollama:', error);
         // Return a fallback response with basic keyword extraction
@@ -159,16 +171,30 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     if (request.type === 'PING') {
         sendResponse({ success: true, message: 'PONG' });
-        return true;
+        return false; // Synchronous response
     }
 
     if (request.type === 'ANALYZE_WITH_OLLAMA') {
+        // Set a timeout for the analysis
+        const timeout = setTimeout(() => {
+            sendResponse({
+                success: false,
+                error: 'Analysis timed out',
+                fallback: {
+                    keywords: request.text.split(' ').filter(word => word.length > 3),
+                    sentiment: 'neutral'
+                }
+            });
+        }, 10000); // 10 second timeout
+
         analyzeTextWithOllama(request.text)
             .then(response => {
+                clearTimeout(timeout);
                 console.log('[SmartSticker] Sending response to content script:', response);
                 sendResponse(response);
             })
             .catch(error => {
+                clearTimeout(timeout);
                 console.error('[SmartSticker] Error in background script:', error);
                 sendResponse({
                     success: false,

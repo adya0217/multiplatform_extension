@@ -30,6 +30,7 @@ class SmartStickerExtension {
         this.giphyKey = 'StFVwDYtCey7YDR1xOJot9tyGYILEDUR';
         this.isActive = false;
         this.lastSearch = '';
+        this.lastAnalyzedText = '';
         this.currentPlatform = null;
         this.currentInput = null;
         this.suggestionBar = null;
@@ -88,29 +89,61 @@ class SmartStickerExtension {
     }
 
     async sendMessageToBackground(message) {
-        return new Promise((resolve, reject) => {
-            if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.sendMessage) {
-                reject(new Error('Chrome runtime not available'));
-                return;
-            }
+        const maxRetries = 3;
+        const retryDelay = 1000; // 1 second
 
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                chrome.runtime.sendMessage(message, response => {
-                    if (chrome.runtime.lastError) {
-                        reject(new Error(chrome.runtime.lastError.message));
-                        return;
-                    }
-                    resolve(response);
+                if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.sendMessage) {
+                    throw new Error('Chrome runtime not available');
+                }
+
+                return await new Promise((resolve, reject) => {
+                    const timeout = setTimeout(() => {
+                        reject(new Error('Message timeout'));
+                    }, 15000); // 15 second timeout
+
+                    chrome.runtime.sendMessage(message, response => {
+                        clearTimeout(timeout);
+                        if (chrome.runtime.lastError) {
+                            reject(new Error(chrome.runtime.lastError.message));
+                            return;
+                        }
+                        resolve(response);
+                    });
                 });
             } catch (error) {
-                reject(error);
+                console.error(`[SmartSticker] Attempt ${attempt} failed:`, error);
+
+                if (attempt === maxRetries) {
+                    throw error;
+                }
+
+                // Wait before retrying
+                await new Promise(resolve => setTimeout(resolve, retryDelay * attempt));
             }
-        });
+        }
     }
 
     detectPlatform() {
         const hostname = window.location.hostname;
         const pathname = window.location.pathname;
+
+        console.log('[SmartSticker] Detecting platform for:', hostname, pathname);
+
+        // Instagram detection
+        if (hostname.includes('instagram.com')) {
+            console.log('[SmartSticker] Detected Instagram platform');
+            return {
+                name: 'Instagram',
+                inputSelector: 'div[contenteditable="true"][role="textbox"][aria-label="Message"], textarea[placeholder*="Message"]',
+                containerSelector: 'form[role="search"], [role="dialog"]',
+                sendButton: 'button[type="submit"], [role="button"][aria-label="Send"]',
+                fileInput: 'input[type="file"]',
+                theme: () => 'light',
+                insertMethod: this.handleInstagramGif.bind(this)
+            };
+        }
 
         // Discord detection
         if (hostname.includes('discord.com')) {
@@ -123,21 +156,23 @@ class SmartStickerExtension {
             };
         }
 
-        const platforms = {
-            'twitter.com': {
+        // Twitter/X detection with DM support
+        if (hostname.includes('twitter.com') || hostname.includes('x.com')) {
+            const isDM = pathname.includes('/messages');
+            return {
                 name: 'Twitter',
-                inputSelector: '[data-testid="tweetTextarea_0"], [contenteditable="true"][role="textbox"]',
-                containerSelector: '[data-testid="toolBar"], [class*="composeTextarea"]',
+                inputSelector: isDM ?
+                    '[data-testid="dmComposerTextInput"]' :
+                    '[data-testid="tweetTextarea_0"]',
+                containerSelector: isDM ?
+                    '[data-testid="dmComposerTextInput"]' :
+                    '[data-testid="tweetTextarea_0"]',
                 theme: () => document.querySelector('[data-theme="dark"]') ? 'dark' : 'light',
-                insertMethod: this.insertTwitterContent.bind(this)
-            },
-            'x.com': {
-                name: 'X',
-                inputSelector: '[data-testid="tweetTextarea_0"], [contenteditable="true"][role="textbox"]',
-                containerSelector: '[data-testid="toolBar"], [class*="composeTextarea"]',
-                theme: () => document.querySelector('[data-theme="dark"]') ? 'dark' : 'light',
-                insertMethod: this.insertTwitterContent.bind(this)
-            },
+                insertMethod: this.handleTwitterGif.bind(this)
+            };
+        }
+
+        const platforms = {
             'reddit.com': {
                 name: 'Reddit',
                 inputSelector: '[contenteditable="true"], textarea[placeholder*="comment"]',
@@ -261,21 +296,22 @@ class SmartStickerExtension {
             this.currentInput = input;
         });
 
-        // Add keyboard event listener for Twitter DM
-        if (window.location.hostname.includes('twitter.com') || window.location.hostname.includes('x.com')) {
-            input.addEventListener('keydown', (event) => {
-                if (event.key === 'Enter' && !event.shiftKey) {
-                    event.preventDefault();
-                    event.stopPropagation();
+        // Add keyboard event listener for Enter key
+        input.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                event.stopPropagation();
 
-                    // Find and click the send button
-                    const sendButton = document.querySelector('[data-testid="dmComposerSendButton"]');
-                    if (sendButton) {
-                        sendButton.click();
-                    }
+                // Find and click the send button
+                const sendButton = document.querySelector('[data-testid="tweetButton"]') ||
+                    document.querySelector('[data-testid="tweetButtonInline"]') ||
+                    document.querySelector('[data-testid="dmComposerSendButton"]');
+
+                if (sendButton) {
+                    sendButton.click();
                 }
-            });
-        }
+            }
+        });
     }
 
     getInputValue(input) {
@@ -292,6 +328,12 @@ class SmartStickerExtension {
             this.hideSuggestionBar();
             return;
         }
+
+        // Prevent multiple analyses of the same text
+        if (this.lastAnalyzedText === text) {
+            return;
+        }
+        this.lastAnalyzedText = text;
 
         if (this.typingTimer) {
             clearTimeout(this.typingTimer);
@@ -517,7 +559,7 @@ class SmartStickerExtension {
 
         // Position the suggestion bar
         if (this.currentInput) {
-            this.positionSuggestionBar(this.currentInput, this.currentInput.parentElement);
+            this.positionSuggestionBar();
         }
     }
 
@@ -700,109 +742,103 @@ class SmartStickerExtension {
     }
 
     async handleInstagramGif(gifUrl) {
-        const input = this.currentInput;
-        const container = input.closest('form') || input.parentElement;
-
         try {
-            console.log('[SmartSticker] Starting Instagram GIF handling');
+            console.log('[SmartSticker] handleInstagramGif start with URL:', gifUrl);
 
-            // Fetch the GIF
-            const response = await fetch(gifUrl);
-            if (!response.ok) throw new Error(`Failed to fetch GIF: ${response.status}`);
+            // 1. Find message input with multiple possible selectors
+            const messageInput = document.querySelector('div[contenteditable="true"][role="textbox"][aria-label="Message"]') ||
+                document.querySelector('textarea[placeholder*="Message"]') ||
+                document.querySelector('[contenteditable="true"][role="textbox"]');
+            console.log('[SmartSticker] Found message input:', messageInput);
 
-            const blob = await response.blob();
-            const file = new File([blob], 'gif.gif', { type: 'image/gif' });
+            // 2. Find file input with multiple possible selectors
+            const fileInput = document.querySelector('input[type="file"]') ||
+                document.querySelector('input[type="file"].x1s85apg') ||
+                document.querySelector('input[accept*="image"]');
+            console.log('[SmartSticker] Found file input:', fileInput);
 
-            // Try multiple methods to find the file input
-            let fileInput = null;
-
-            // Method 1: Look for file input in the current container
-            fileInput = container.querySelector('input[type="file"]');
-
-            // Method 2: Look for file input in any form that contains our input
-            if (!fileInput) {
-                const forms = document.querySelectorAll('form');
-                for (const form of forms) {
-                    if (form.contains(input)) {
-                        fileInput = form.querySelector('input[type="file"]');
-                        if (fileInput) break;
-                    }
-                }
+            if (!messageInput) {
+                console.error('[SmartSticker] Message input not found. Available inputs:',
+                    document.querySelectorAll('[contenteditable="true"], textarea, input[type="text"]'));
+                throw new Error('Message input not found');
             }
-
-            // Method 3: Look for file input near comment areas
             if (!fileInput) {
-                const fileInputs = document.querySelectorAll('input[type="file"]');
-                fileInput = Array.from(fileInputs).find(input =>
-                    input.closest('form') &&
-                    (input.closest('form').querySelector('textarea[placeholder*="comment"]') ||
-                        input.closest('form').querySelector('[contenteditable="true"][role="textbox"]') ||
-                        input.closest('form').querySelector('[aria-label*="comment"]'))
-                );
-            }
-
-            if (!fileInput) {
+                console.error('[SmartSticker] File input not found. Available file inputs:',
+                    document.querySelectorAll('input[type="file"]'));
                 throw new Error('File input not found');
             }
 
-            // Create DataTransfer and add the file
-            const dataTransfer = new DataTransfer();
-            dataTransfer.items.add(file);
-            fileInput.files = dataTransfer.files;
+            // 3. Fetch and process GIF
+            console.log('[SmartSticker] Fetching GIF from URL:', gifUrl);
+            const response = await fetch(gifUrl);
+            console.log('[SmartSticker] Fetch response status:', response.status);
 
-            // Trigger the change event
-            fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-
-            // Wait for upload to complete
-            await new Promise(resolve => setTimeout(resolve, 1500));
-
-            // Try multiple methods to find the send button
-            let sendButton = null;
-
-            // Method 1: Look in the current container
-            sendButton = container.querySelector('button[type="submit"]') ||
-                container.querySelector('[role="button"]');
-
-            // Method 2: Look for buttons with specific attributes
-            if (!sendButton) {
-                sendButton = document.querySelector('button[aria-label*="Post"]') ||
-                    document.querySelector('button[aria-label*="Share"]') ||
-                    document.querySelector('button[aria-label*="Send"]');
+            if (!response.ok) {
+                console.error('[SmartSticker] Failed to fetch GIF:', response.status);
+                throw new Error(`Failed to fetch GIF: ${response.status}`);
             }
 
-            // Method 3: Look for buttons with specific classes
-            if (!sendButton) {
-                sendButton = document.querySelector('button[class*="submit"]') ||
-                    document.querySelector('button[class*="send"]') ||
-                    document.querySelector('button[class*="post"]');
+            const blob = await response.blob();
+            console.log('[SmartSticker] GIF blob size:', blob.size, 'type:', blob.type);
+
+            // 4. Create File object with proper metadata
+            const file = new File([blob], 'animation.gif', {
+                type: 'image/gif',
+                lastModified: Date.now()
+            });
+            console.log('[SmartSticker] Created File object:', file.name, file.type, file.size);
+
+            // 5. Set up file input
+            try {
+                const dataTransfer = new DataTransfer();
+                dataTransfer.items.add(file);
+                fileInput.files = dataTransfer.files;
+                console.log('[SmartSticker] Files set on input:', fileInput.files.length);
+            } catch (error) {
+                console.error('[SmartSticker] Error setting files:', error);
+                throw new Error('Failed to set files on input: ' + error.message);
             }
+
+            // 6. Trigger upload
+            console.log('[SmartSticker] Dispatching change event');
+            const changeEvent = new Event('change', { bubbles: true });
+            fileInput.dispatchEvent(changeEvent);
+
+            // 7. Wait for upload with progress check
+            console.log('[SmartSticker] Waiting for upload to complete...');
+            await new Promise(resolve => setTimeout(resolve, 2000));
+
+            // 8. Try multiple methods to send
+            const sendButton = document.querySelector('button[type="submit"]') ||
+                document.querySelector('[role="button"][aria-label="Send"]') ||
+                document.querySelector('[data-testid="send-button"]') ||
+                document.querySelector('button[aria-label="Send message"]');
 
             if (sendButton) {
-                console.log('[SmartSticker] Clicking send button');
+                console.log('[SmartSticker] Found send button, clicking...');
                 sendButton.click();
-
-                // Wait for the post to be sent
-                await new Promise(resolve => setTimeout(resolve, 1000));
-                console.log('[SmartSticker] Successfully sent GIF to Instagram');
-                return true;
             } else {
-                throw new Error('Send button not found');
+                console.log('[SmartSticker] No send button found, trying Enter key...');
+                const enterEvent = new KeyboardEvent('keydown', {
+                    key: 'Enter',
+                    code: 'Enter',
+                    keyCode: 13,
+                    which: 13,
+                    bubbles: true
+                });
+                messageInput.dispatchEvent(enterEvent);
             }
+
+            console.log('[SmartSticker] Successfully sent GIF to Instagram');
+            return true;
         } catch (error) {
             console.error('[SmartSticker] Error handling Instagram GIF:', error);
-            // Fallback to URL if upload fails
-            try {
-                if (input.value !== undefined) {
-                    input.value += ` ${gifUrl}`;
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                } else if (input.textContent !== undefined) {
-                    input.textContent += ` ${gifUrl}`;
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                }
-                console.log('[SmartSticker] Fallback: Inserted GIF URL as text');
-            } catch (fallbackError) {
-                console.error('[SmartSticker] Fallback also failed:', fallbackError);
-            }
+            // Log the current DOM state for debugging
+            console.log('[SmartSticker] Current DOM state:', {
+                messageInputs: document.querySelectorAll('[contenteditable="true"], textarea, input[type="text"]'),
+                fileInputs: document.querySelectorAll('input[type="file"]'),
+                sendButtons: document.querySelectorAll('button[type="submit"], [role="button"][aria-label="Send"]')
+            });
             throw error;
         }
     }
@@ -811,47 +847,140 @@ class SmartStickerExtension {
         try {
             console.log('[SmartSticker] Starting Twitter GIF handling');
 
-            // Find the composer container
-            const composerContainer = document.querySelector('[data-testid="tweetTextarea_0"]')?.closest('div[role="group"]');
+            // Determine if we're in chat/DM or tweet composer
+            const isDM = window.location.pathname.includes('/messages');
+            console.log('[SmartSticker] Context:', isDM ? 'DM' : 'Tweet');
+
+            // 1. Find the appropriate input and container
+            let composerContainer, textInput, mediaButton;
+
+            if (isDM) {
+                // DM interface - try multiple selectors
+                composerContainer = document.querySelector('[data-testid="dmComposerTextInput"]')?.closest('[role="group"]') ||
+                    document.querySelector('[data-testid="dmComposerTextInput"]')?.closest('div[role="group"]') ||
+                    document.querySelector('[data-testid="dmComposerTextInput"]')?.closest('div[class*="composer"]') ||
+                    document.querySelector('[data-testid="dmComposerTextInput"]')?.parentElement;
+
+                textInput = document.querySelector('[data-testid="dmComposerTextInput"]') ||
+                    document.querySelector('[contenteditable="true"][role="textbox"][aria-label="Message"]') ||
+                    document.querySelector('[contenteditable="true"][role="textbox"]');
+
+                mediaButton = document.querySelector('[data-testid="dmComposerUploadButton"]') ||
+                    document.querySelector('[aria-label="Add photos or video"]') ||
+                    document.querySelector('input[type="file"]') ||
+                    document.querySelector('[role="button"][aria-label="Add photos or video"]');
+            } else {
+                // Tweet composer
+                composerContainer = document.querySelector('[data-testid="tweetTextarea_0"]')?.closest('[role="group"]') ||
+                    document.querySelector('[data-testid="tweetTextarea_0"]')?.closest('div[role="group"]');
+
+                textInput = document.querySelector('[data-testid="tweetTextarea_0"]') ||
+                    document.querySelector('[contenteditable="true"][role="textbox"]');
+
+                mediaButton = composerContainer?.querySelector('[data-testid="fileInput"]') ||
+                    composerContainer?.querySelector('input[type="file"]') ||
+                    composerContainer?.querySelector('[aria-label="Add photos or video"]');
+            }
+
+            // Log the found elements for debugging
+            console.log('[SmartSticker] Found elements:', {
+                composerContainer: composerContainer ? 'Found' : 'Not found',
+                textInput: textInput ? 'Found' : 'Not found',
+                mediaButton: mediaButton ? 'Found' : 'Not found'
+            });
+
+            if (!textInput) {
+                throw new Error('Text input not found');
+            }
+
+            // If we don't have a container but have an input, use the input's parent
+            if (!composerContainer && textInput) {
+                composerContainer = textInput.parentElement;
+                console.log('[SmartSticker] Using input parent as container');
+            }
+
             if (!composerContainer) {
                 throw new Error('Composer container not found');
             }
 
-            // Find the file input
-            const fileInput = composerContainer.querySelector('input[type="file"]');
-            if (!fileInput) {
-                throw new Error('File input not found');
-            }
-
-            // Fetch the GIF and create a File object
+            // 2. Fetch the GIF
+            console.log('[SmartSticker] Fetching GIF from URL:', gifUrl);
             const response = await fetch(gifUrl);
             if (!response.ok) throw new Error(`Failed to fetch GIF: ${response.status}`);
 
             const blob = await response.blob();
-            const file = new File([blob], 'gif.gif', { type: 'image/gif' });
+            const file = new File([blob], 'animation.gif', {
+                type: 'image/gif',
+                lastModified: Date.now()
+            });
 
-            // Create DataTransfer and add the file
+            // 3. Create DataTransfer and set files
             const dataTransfer = new DataTransfer();
             dataTransfer.items.add(file);
-            fileInput.files = dataTransfer.files;
 
-            // Trigger the change event
-            fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-
-            // Wait for upload to complete
-            await new Promise(resolve => setTimeout(resolve, 1500));
-
-            // Find and click the send button
-            const sendButton = composerContainer.querySelector('[data-testid="tweetButton"]') ||
-                composerContainer.querySelector('[data-testid="tweetButtonInline"]');
-
-            if (sendButton) {
-                sendButton.click();
-                console.log('[SmartSticker] Successfully sent GIF to Twitter');
-                return true;
+            // 4. Set the file on the input
+            if (mediaButton) {
+                if (mediaButton.tagName === 'INPUT') {
+                    mediaButton.files = dataTransfer.files;
+                    // Trigger change event
+                    mediaButton.dispatchEvent(new Event('change', { bubbles: true }));
+                } else {
+                    // If it's a button, we need to find the hidden file input
+                    const fileInput = document.querySelector('input[type="file"][accept*="image"]') ||
+                        document.querySelector('input[type="file"]');
+                    if (fileInput) {
+                        fileInput.files = dataTransfer.files;
+                        fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+                    } else {
+                        // If no file input found, try clicking the media button
+                        mediaButton.click();
+                        // Wait a bit for the file dialog to appear
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                        // Try to find the file input again
+                        const fileInput = document.querySelector('input[type="file"][accept*="image"]') ||
+                            document.querySelector('input[type="file"]');
+                        if (fileInput) {
+                            fileInput.files = dataTransfer.files;
+                            fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                    }
+                }
             } else {
+                // If no media button found, try to find any file input
+                const fileInput = document.querySelector('input[type="file"][accept*="image"]') ||
+                    document.querySelector('input[type="file"]');
+                if (fileInput) {
+                    fileInput.files = dataTransfer.files;
+                    fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+                } else {
+                    throw new Error('No file input found');
+                }
+            }
+
+            // 5. Wait for upload to complete
+            console.log('[SmartSticker] Waiting for upload to complete...');
+            await new Promise(resolve => setTimeout(resolve, 2000));
+
+            // 6. Find and click the appropriate send button
+            let sendButton;
+            if (isDM) {
+                sendButton = document.querySelector('[data-testid="dmComposerSendButton"]') ||
+                    document.querySelector('[role="button"][aria-label="Send"]') ||
+                    document.querySelector('button[type="submit"]');
+            } else {
+                sendButton = document.querySelector('[data-testid="tweetButton"]') ||
+                    document.querySelector('[data-testid="tweetButtonInline"]');
+            }
+
+            if (!sendButton) {
                 throw new Error('Send button not found');
             }
+
+            // 7. Click the send button
+            sendButton.click();
+            console.log('[SmartSticker] Successfully sent GIF to', isDM ? 'DM' : 'Tweet');
+            return true;
+
         } catch (error) {
             console.error('[SmartSticker] Error handling Twitter GIF:', error);
             throw error;
@@ -1046,18 +1175,22 @@ class SmartStickerExtension {
     }
 
     insertStickerIntoInput(gifUrl) {
-        if (!this.currentInput) return;
+        if (!this.currentInput) {
+            console.error('[SmartSticker] No current input found');
+            return;
+        }
 
         const platform = this.currentPlatform;
-        console.log('[SmartSticker] Inserting GIF for platform:', platform.name);
+        console.log('[SmartSticker] Inserting GIF for platform:', platform.name, 'with URL:', gifUrl);
 
         try {
             switch (platform.name) {
+                case 'Instagram':
+                    console.log('[SmartSticker] Using Instagram-specific handler');
+                    this.handleInstagramGif(gifUrl);
+                    break;
                 case 'Discord':
                     this.handleDiscordGif(gifUrl);
-                    break;
-                case 'Instagram':
-                    this.handleInstagramGif(gifUrl);
                     break;
                 case 'Twitter':
                     this.handleTwitterGif(gifUrl);
@@ -1075,6 +1208,7 @@ class SmartStickerExtension {
                     this.handleTeamsGif(gifUrl);
                     break;
                 default:
+                    console.log('[SmartSticker] Using generic handler');
                     if (this.currentInput.value !== undefined) {
                         this.currentInput.value += ` ${gifUrl}`;
                         this.currentInput.dispatchEvent(new Event('input', { bubbles: true }));
@@ -1179,7 +1313,7 @@ class SmartStickerExtension {
         const style = document.createElement('style');
         style.id = 'smart-sticker-styles';
         style.textContent = `
-      .smart-sticker-bar {
+            .smart-sticker-bar {
                 position: fixed;
                 background: var(--smart-sticker-bg, #ffffff);
                 border: 1px solid var(--smart-sticker-border, #e1e5e9);
@@ -1194,14 +1328,17 @@ class SmartStickerExtension {
                 transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
                 display: none;
                 visibility: hidden;
+                width: 400px;
             }
 
             .smart-sticker-bar.show {
                 opacity: 1;
                 transform: translateY(0);
-      }
+                display: block;
+                visibility: visible;
+            }
       
-      .smart-sticker-bar[data-theme="dark"] {
+            .smart-sticker-bar[data-theme="dark"] {
                 --smart-sticker-bg: #36393f;
                 --smart-sticker-border: #40444b;
                 --smart-sticker-text: #dcddde;
@@ -1209,35 +1346,35 @@ class SmartStickerExtension {
 
             .smart-sticker-grid {
                 display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
+                grid-template-columns: repeat(2, 1fr);
                 gap: 8px;
                 max-height: 160px;
                 overflow-y: auto;
-      }
+            }
       
-      .smart-sticker-item {
+            .smart-sticker-item {
                 position: relative;
                 aspect-ratio: 1;
                 border-radius: 8px;
                 overflow: hidden;
-        cursor: pointer;
+                cursor: pointer;
                 transition: transform 0.15s ease;
                 border: 2px solid transparent;
-      }
+            }
       
-      .smart-sticker-item:hover {
-        transform: scale(1.05);
+            .smart-sticker-item:hover {
+                transform: scale(1.05);
                 border-color: #5865f2;
-      }
+            }
       
-      .smart-sticker-item img {
-        width: 100%;
-        height: 100%;
-        object-fit: cover;
+            .smart-sticker-item img {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
                 border-radius: 6px;
-      }
+            }
       
-      .smart-sticker-loader,
+            .smart-sticker-loader,
             .smart-sticker-error {
                 grid-column: 1 / -1;
                 text-align: center;
