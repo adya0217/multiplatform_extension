@@ -99,24 +99,32 @@ class SmartStickerExtension {
                 }
 
                 return await new Promise((resolve, reject) => {
-                    const timeout = setTimeout(() => {
-                        reject(new Error('Message timeout'));
-                    }, 15000); // 15 second timeout
-
-                    chrome.runtime.sendMessage(message, response => {
-                        clearTimeout(timeout);
-                        if (chrome.runtime.lastError) {
-                            reject(new Error(chrome.runtime.lastError.message));
-                            return;
-                        }
-                        resolve(response);
-                    });
+                    try {
+                        chrome.runtime.sendMessage(message, response => {
+                            if (chrome.runtime.lastError) {
+                                reject(new Error(chrome.runtime.lastError.message));
+                                return;
+                            }
+                            resolve(response);
+                        });
+                    } catch (error) {
+                        reject(error);
+                    }
                 });
             } catch (error) {
                 console.error(`[SmartSticker] Attempt ${attempt} failed:`, error);
 
                 if (attempt === maxRetries) {
-                    throw error;
+                    // On final attempt, return a fallback response instead of throwing
+                    return {
+                        success: true,
+                        data: {
+                            sentiment: 'neutral',
+                            emotions: message.text.split(' ').filter(word => word.length > 3),
+                            intensity: 'medium',
+                            gif_query: message.text
+                        }
+                    };
                 }
 
                 // Wait before retrying
@@ -131,6 +139,20 @@ class SmartStickerExtension {
 
         console.log('[SmartSticker] Detecting platform for:', hostname, pathname);
 
+        // Discord detection
+        if (hostname.includes('discord.com')) {
+            console.log('[SmartSticker] Detected Discord platform');
+            return {
+                name: 'Discord',
+                inputSelector: '[class*="channelTextArea"] [class*="slateTextArea"]',
+                containerSelector: '[class*="channelTextArea"]',
+                sendButton: 'button[type="submit"], [class*="sendButton"]',
+                fileInput: 'input[type="file"]',
+                theme: () => document.documentElement.getAttribute('data-theme') || 'dark',
+                insertMethod: this.handleDiscordGif.bind(this)
+            };
+        }
+
         // Instagram detection
         if (hostname.includes('instagram.com')) {
             console.log('[SmartSticker] Detected Instagram platform');
@@ -142,17 +164,6 @@ class SmartStickerExtension {
                 fileInput: 'input[type="file"]',
                 theme: () => 'light',
                 insertMethod: this.handleInstagramGif.bind(this)
-            };
-        }
-
-        // Discord detection
-        if (hostname.includes('discord.com')) {
-            return {
-                name: 'Discord',
-                inputSelector: '[class*="channelTextArea"] [class*="slateTextArea"]',
-                containerSelector: '[class*="channelTextArea"]',
-                theme: () => 'dark',
-                insertMethod: 'markdown'
             };
         }
 
@@ -297,21 +308,20 @@ class SmartStickerExtension {
         });
 
         // Add keyboard event listener for Enter key
-        input.addEventListener('keydown', (event) => {
-            if (event.key === 'Enter' && !event.shiftKey) {
-                event.preventDefault();
-                event.stopPropagation();
+        if (window.location.hostname.includes('twitter.com') || window.location.hostname.includes('x.com')) {
+            input.addEventListener('keydown', (event) => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
+                    event.stopPropagation();
 
-                // Find and click the send button
-                const sendButton = document.querySelector('[data-testid="tweetButton"]') ||
-                    document.querySelector('[data-testid="tweetButtonInline"]') ||
-                    document.querySelector('[data-testid="dmComposerSendButton"]');
-
-                if (sendButton) {
-                    sendButton.click();
+                    // Find and click the send button
+                    const sendButton = document.querySelector('[data-testid="dmComposerSendButton"]');
+                    if (sendButton) {
+                        sendButton.click();
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     getInputValue(input) {
@@ -329,12 +339,6 @@ class SmartStickerExtension {
             return;
         }
 
-        // Prevent multiple analyses of the same text
-        if (this.lastAnalyzedText === text) {
-            return;
-        }
-        this.lastAnalyzedText = text;
-
         if (this.typingTimer) {
             clearTimeout(this.typingTimer);
         }
@@ -347,32 +351,23 @@ class SmartStickerExtension {
                 // Clean the text by removing URLs and extra whitespace
                 const cleanText = text.replace(/https?:\/\/[^\s]+/g, '').trim();
 
+                // Try to get smart suggestions from Ollama if enabled
+                let searchQuery = cleanText;
                 if (this.ollamaEnabled) {
-                    // Step 1: Get text analysis from Ollama
-                    console.log('[SmartSticker] Analyzing text with Ollama:', cleanText);
-                    const analysis = await this.analyzeWithOllama(cleanText);
-                    console.log('[SmartSticker] Received analysis:', analysis);
-
-                    if (!analysis.success) {
-                        throw new Error(analysis.error || 'Analysis failed');
+                    try {
+                        const analysis = await this.analyzeWithOllama(cleanText);
+                        if (analysis?.success && analysis?.data?.gif_query) {
+                            searchQuery = analysis.data.gif_query;
+                        }
+                    } catch (error) {
+                        console.error('[SmartSticker] Ollama analysis failed:', error);
+                        // Continue with original text
                     }
-
-                    // Step 2: Use the analysis to search for GIFs
-                    const { sentiment, emotions, intensity, gif_query } = analysis.data;
-                    console.log('[SmartSticker] Using analysis for GIF search:', { sentiment, emotions, intensity, gif_query });
-
-                    // Create a more specific search query combining emotions and context
-                    const searchQuery = this.createSearchQuery(analysis.data);
-                    console.log('[SmartSticker] Final search query:', searchQuery);
-
-                    // Step 3: Fetch GIFs using the analyzed query
-                    const items = await this.searchStickers(searchQuery);
-                    this.renderItems(items);
-                } else {
-                    // Fallback to direct search if Ollama is disabled
-                    const items = await this.searchStickers(cleanText);
-                    this.renderItems(items);
                 }
+
+                // Fetch GIFs using the query
+                const items = await this.searchStickers(searchQuery);
+                this.renderItems(items);
             } catch (error) {
                 console.error('[SmartSticker] Error in text analysis or GIF search:', error);
                 // Fallback to direct search with cleaned text
@@ -390,79 +385,70 @@ class SmartStickerExtension {
         }, this.typingDelay);
     }
 
-    createSearchQuery(analysis) {
-        const { sentiment, emotions, intensity, gif_query } = analysis;
-
-        // If we have a good gif_query from Ollama, use it
-        if (gif_query && gif_query.length > 0) {
-            return gif_query;
-        }
-
-        // Otherwise, construct a query from emotions and sentiment
-        const emotionQuery = emotions.length > 0 ? emotions[0] : '';
-        const intensityModifier = intensity === 'high' ? 'very ' : intensity === 'low' ? 'slightly ' : '';
-
-        if (emotionQuery) {
-            return `${intensityModifier}${emotionQuery}`;
-        }
-
-        // Fallback to sentiment if no emotions
-        return sentiment === 'positive' ? 'happy' :
-            sentiment === 'negative' ? 'sad' :
-                'neutral';
-    }
-
-    async processTextInput(text) {
-        console.log(`[SmartSticker] Processing text input: "${text}"`);
-
-        let searchQuery = text;
-
-        // Try to get smart suggestions from Ollama if enabled
-        if (this.ollamaEnabled) {
-            try {
-                const analysis = await this.analyzeWithOllama(text);
-                if (analysis?.searchQuery) {
-                    searchQuery = analysis.searchQuery;
-                }
-            } catch (error) {
-                console.error('[SmartSticker] Ollama analysis failed:', error);
-                // Continue with original text
-            }
-        }
-
-        await this.loadSearch(searchQuery);
-    }
-
     async analyzeWithOllama(text) {
         try {
             if (!text || typeof text !== 'string') {
                 throw new Error('Invalid input text');
             }
 
-            if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.sendMessage) {
-                throw new Error('Chrome runtime not available');
-            }
-
             console.log('[SmartSticker] Analyzing text with Ollama:', text);
+
+            // Create a more specific and context-aware prompt for GIF search terms
+            const prompt = `Given the text: "${text}"
+            Think about what kind of animated GIF would be most appropriate and engaging as a response in a conversation.
+            Focus on specific actions, emotions, or reactions that would make sense in this context.
+            
+            Examples of good responses:
+            - "how are you" -> "waving hello, friendly greeting, happy wave"
+            - "i love ice cream" -> "eating ice cream, excited food, dessert happy"
+            - "that's so funny" -> "laughing hard, rolling on floor, funny reaction"
+            - "good morning" -> "sunrise greeting, morning coffee, waking up happy"
+            - "congratulations" -> "celebration dance, happy jump, success party"
+            
+            Extract 2-3 specific words or short phrases that would be good for searching animated GIFs.
+            Focus on actions and emotions that would make a good animated response.
+            Just list the words/phrases separated by commas, nothing else.`;
+
             const response = await this.sendMessageToBackground({
                 type: 'ANALYZE_WITH_OLLAMA',
-                text: text
+                text: text,
+                prompt: prompt
             });
 
-            if (!response) {
-                throw new Error('No response from background script');
+            // Always return a valid response, even if analysis failed
+            if (!response || !response.success) {
+                const fallbackKeywords = text
+                    .toLowerCase()
+                    .split(/\s+/)
+                    .filter(word => word.length > 3 && !['what', 'when', 'where', 'which', 'whose', 'whom', 'this', 'that', 'these', 'those'].includes(word));
+
+                return {
+                    success: true,
+                    data: {
+                        sentiment: 'neutral',
+                        emotions: fallbackKeywords,
+                        intensity: 'medium',
+                        gif_query: fallbackKeywords.join(' ')
+                    }
+                };
             }
 
-            console.log('[SmartSticker] Received analysis:', response);
             return response;
         } catch (error) {
             console.error('[SmartSticker] Error in text analysis:', error);
+            // Return a fallback response with basic keyword extraction
+            const fallbackKeywords = text
+                .toLowerCase()
+                .split(/\s+/)
+                .filter(word => word.length > 3 && !['what', 'when', 'where', 'which', 'whose', 'whom', 'this', 'that', 'these', 'those'].includes(word));
+
             return {
-                success: false,
-                error: error.message,
-                fallback: {
-                    keywords: text.split(' ').filter(word => word.length > 3),
-                    sentiment: 'neutral'
+                success: true,
+                data: {
+                    sentiment: 'neutral',
+                    emotions: fallbackKeywords,
+                    intensity: 'medium',
+                    gif_query: fallbackKeywords.join(' ')
                 }
             };
         }
@@ -717,7 +703,7 @@ class SmartStickerExtension {
             // Wait for upload to complete
             await new Promise(resolve => setTimeout(resolve, 1500));
 
-            // Find the input element
+            // Find the input element with the correct selector
             const input = inputContainer.querySelector('[contenteditable="true"]');
             if (!input) {
                 throw new Error('Input element not found');
@@ -1175,22 +1161,18 @@ class SmartStickerExtension {
     }
 
     insertStickerIntoInput(gifUrl) {
-        if (!this.currentInput) {
-            console.error('[SmartSticker] No current input found');
-            return;
-        }
+        if (!this.currentInput) return;
 
         const platform = this.currentPlatform;
-        console.log('[SmartSticker] Inserting GIF for platform:', platform.name, 'with URL:', gifUrl);
+        console.log('[SmartSticker] Inserting GIF for platform:', platform.name);
 
         try {
             switch (platform.name) {
-                case 'Instagram':
-                    console.log('[SmartSticker] Using Instagram-specific handler');
-                    this.handleInstagramGif(gifUrl);
-                    break;
                 case 'Discord':
                     this.handleDiscordGif(gifUrl);
+                    break;
+                case 'Instagram':
+                    this.handleInstagramGif(gifUrl);
                     break;
                 case 'Twitter':
                     this.handleTwitterGif(gifUrl);
@@ -1208,7 +1190,6 @@ class SmartStickerExtension {
                     this.handleTeamsGif(gifUrl);
                     break;
                 default:
-                    console.log('[SmartSticker] Using generic handler');
                     if (this.currentInput.value !== undefined) {
                         this.currentInput.value += ` ${gifUrl}`;
                         this.currentInput.dispatchEvent(new Event('input', { bubbles: true }));
